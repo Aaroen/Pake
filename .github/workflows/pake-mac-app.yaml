@@ -1,0 +1,313 @@
+name: Build macOS App With Pake
+
+env:
+  NODE_VERSION: "22"
+  PNPM_VERSION: "10.26.2"
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "Website URL"
+        required: true
+        type: string
+        default: "https://www.douyin.com"
+
+      name:
+        description: "Application name"
+        required: true
+        type: string
+        default: "Douyin"
+
+      icon:
+        description: "Icon URL or local path; leave empty to auto-fetch"
+        required: false
+        type: string
+        default: ""
+
+      width:
+        description: "Window width in pixels"
+        required: false
+        type: string
+        default: "1200"
+
+      height:
+        description: "Window height in pixels"
+        required: false
+        type: string
+        default: "780"
+
+      app_version:
+        description: "Application version"
+        required: false
+        type: string
+        default: "1.0.0"
+
+      top_bar_height:
+        description: "Top safe-area height for macOS traffic-light buttons"
+        required: false
+        type: string
+        default: "32"
+
+      multi_arch:
+        description: "Build universal Intel + Apple Silicon binary"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build macOS App
+    runs-on: macos-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Setup Node.js and pnpm
+        uses: ./.github/actions/setup-env
+        with:
+          mode: build
+
+      - name: Build Pake CLI
+        run: pnpm run cli:build
+
+      - name: Restore Rust cache
+        uses: actions/cache/restore@v4.2.0
+        id: cache_store
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            src-tauri/target/
+          key: ${{ runner.os }}-cargo-pake-${{ hashFiles('**/Cargo.lock') }}
+
+      # 为网页顶部预留 macOS 红黄绿按钮区域。
+      # 这里使用 CSS 变量，便于在 workflow_dispatch 中调整高度。
+      - name: Create macOS top safe-area CSS
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TOP_BAR_HEIGHT="${{ inputs.top_bar_height }}"
+
+          cat > "$RUNNER_TEMP/pake-macos-topbar.css" <<EOF
+          :root {
+            --pake-macos-top-bar-height: ${TOP_BAR_HEIGHT}px;
+          }
+
+          /*
+           * Pake 在 macOS hide-title-bar 模式下使用 Overlay 标题栏。
+           * 给页面内容增加顶部安全区域，避免红黄绿按钮覆盖网页内容。
+           */
+          html {
+            padding-top: var(--pake-macos-top-bar-height) !important;
+            box-sizing: border-box !important;
+          }
+
+          body {
+            min-height: calc(100vh - var(--pake-macos-top-bar-height)) !important;
+            box-sizing: border-box !important;
+          }
+
+          /*
+           * 常见全屏根节点同步缩小高度。
+           * 对大多数 React/Vue 页面有效。
+           */
+          #root,
+          #app,
+          #__next,
+          [data-reactroot] {
+            min-height: calc(100vh - var(--pake-macos-top-bar-height)) !important;
+            box-sizing: border-box !important;
+          }
+          EOF
+
+      # 将普通 HTTP/HTTPS 链接强制设置为 target=_blank，
+      # 同时拦截点击事件，让链接尽量通过 Pake 的新窗口机制打开。
+      - name: Create open-links-in-new-window script
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat > "$RUNNER_TEMP/pake-open-links-new-window.js" <<'EOF'
+          (() => {
+            "use strict";
+
+            const isOpenableHttpUrl = (url) => {
+              if (!url) return false;
+
+              try {
+                const parsed = new URL(url, window.location.href);
+                return parsed.protocol === "http:" || parsed.protocol === "https:";
+              } catch {
+                return false;
+              }
+            };
+
+            const getAnchor = (event) => {
+              const target = event.target;
+              if (!(target instanceof Element)) return null;
+              return target.closest("a[href]");
+            };
+
+            const prepareAnchor = (anchor) => {
+              if (!(anchor instanceof HTMLAnchorElement)) return;
+              if (!isOpenableHttpUrl(anchor.href)) return;
+
+              // 保留下载、邮件、电话等特殊行为。
+              if (anchor.hasAttribute("download")) return;
+
+              anchor.target = "_blank";
+              anchor.rel = "noopener noreferrer";
+            };
+
+            const scanAnchors = (root = document) => {
+              if (root instanceof HTMLAnchorElement) {
+                prepareAnchor(root);
+              }
+
+              if (root.querySelectorAll) {
+                root.querySelectorAll("a[href]").forEach(prepareAnchor);
+              }
+            };
+
+            // 处理初始页面和动态渲染出来的链接。
+            scanAnchors();
+
+            const observer = new MutationObserver((mutations) => {
+              for (const mutation of mutations) {
+                for (const node of mutation.addedNodes) {
+                  if (node.nodeType === Node.ELEMENT_NODE) {
+                    scanAnchors(node);
+                  }
+                }
+              }
+            });
+
+            if (document.documentElement) {
+              observer.observe(document.documentElement, {
+                childList: true,
+                subtree: true,
+              });
+            }
+
+            // 捕获阶段拦截普通链接点击，尽量避免网站脚本把链接改回当前窗口。
+            document.addEventListener(
+              "click",
+              (event) => {
+                if (!(event instanceof MouseEvent)) return;
+                if (event.defaultPrevented) return;
+
+                // 只处理普通左键点击。
+                if (event.button !== 0) return;
+                if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) {
+                  return;
+                }
+
+                const anchor = getAnchor(event);
+                if (!anchor) return;
+
+                prepareAnchor(anchor);
+
+                if (!isOpenableHttpUrl(anchor.href)) return;
+                if (anchor.hasAttribute("download")) return;
+
+                event.preventDefault();
+                event.stopImmediatePropagation();
+
+                // 由 Pake 的 --new-window 配置接管新窗口。
+                window.open(
+                  anchor.href,
+                  "_blank",
+                  "noopener,noreferrer,width=1200,height=780,resizable=yes"
+                );
+              },
+              true
+            );
+          })();
+          EOF
+
+      - name: Build macOS application
+        shell: bash
+        env:
+          PAKE_URL: ${{ inputs.url }}
+          PAKE_NAME: ${{ inputs.name }}
+          PAKE_ICON: ${{ inputs.icon }}
+          PAKE_WIDTH: ${{ inputs.width }}
+          PAKE_HEIGHT: ${{ inputs.height }}
+          PAKE_VERSION: ${{ inputs.app_version }}
+          PAKE_MULTI_ARCH: ${{ inputs.multi_arch }}
+        run: |
+          set -euo pipefail
+
+          ARGS=(
+            "$PAKE_URL"
+            "--name" "$PAKE_NAME"
+            "--width" "$PAKE_WIDTH"
+            "--height" "$PAKE_HEIGHT"
+            "--app-version" "$PAKE_VERSION"
+
+            # macOS 隐藏原生标题栏。
+            "--hide-title-bar"
+
+            # 允许网页创建 Pake 原生新窗口。
+            "--new-window"
+
+            # 允许跨域链接继续留在 Pake 窗口体系中。
+            "--force-internal-navigation"
+
+            # 注入顶部安全区域和新窗口链接处理脚本。
+            "--inject"
+            "$RUNNER_TEMP/pake-macos-topbar.css,$RUNNER_TEMP/pake-open-links-new-window.js"
+          )
+
+          if [ -n "$PAKE_ICON" ]; then
+            ARGS+=("--icon" "$PAKE_ICON")
+          fi
+
+          if [ "$PAKE_MULTI_ARCH" == "true" ]; then
+            ARGS+=("--multi-arch")
+          fi
+
+          echo "Running Pake build..."
+          node dist/cli.js "${ARGS[@]}"
+
+      - name: Upload DMG
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ inputs.name }}-macOS
+          path: "*.dmg"
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Upload macOS application bundle
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ inputs.name }}-macOS-App
+          path: "*.app"
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Save Rust cache
+        uses: actions/cache/save@v4.2.0
+        if: steps.cache_store.outputs.cache-hit != 'true'
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            src-tauri/target/
+          key: ${{ runner.os }}-cargo-pake-${{ hashFiles('**/Cargo.lock') }}
