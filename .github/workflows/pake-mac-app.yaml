@@ -44,10 +44,10 @@ on:
         default: "1.0.0"
 
       top_bar_height:
-        description: "Top safe-area height for macOS traffic-light buttons"
+        description: "macOS traffic-light safe area in pixels"
         required: false
         type: string
-        default: "32"
+        default: "52"
 
       multi_arch:
         description: "Build universal Intel + Apple Silicon binary"
@@ -93,149 +93,157 @@ jobs:
             src-tauri/target/
           key: ${{ runner.os }}-cargo-pake-${{ hashFiles('**/Cargo.lock') }}
 
-      # 为网页顶部预留 macOS 红黄绿按钮区域。
-      # 这里使用 CSS 变量，便于在 workflow_dispatch 中调整高度。
-      - name: Create macOS top safe-area CSS
+      - name: Create macOS traffic-light safe-area patch
         shell: bash
+        env:
+          TOP_BAR_HEIGHT: ${{ inputs.top_bar_height }}
         run: |
           set -euo pipefail
 
-          TOP_BAR_HEIGHT="${{ inputs.top_bar_height }}"
+          case "$TOP_BAR_HEIGHT" in
+            ''|*[!0-9]*)
+              echo "top_bar_height must contain only digits"
+              exit 1
+              ;;
+          esac
 
-          cat > "$RUNNER_TEMP/pake-macos-topbar.css" <<EOF
+          cat > "$RUNNER_TEMP/pake-macos-safe-area.css" <<EOF
           :root {
-            --pake-macos-top-bar-height: ${TOP_BAR_HEIGHT}px;
+            --pake-macos-safe-top: ${TOP_BAR_HEIGHT}px;
           }
 
-          /*
-           * Pake 在 macOS hide-title-bar 模式下使用 Overlay 标题栏。
-           * 给页面内容增加顶部安全区域，避免红黄绿按钮覆盖网页内容。
-           */
-          html {
-            padding-top: var(--pake-macos-top-bar-height) !important;
-            box-sizing: border-box !important;
-          }
-
+          html,
           body {
-            min-height: calc(100vh - var(--pake-macos-top-bar-height)) !important;
+            margin: 0 !important;
             box-sizing: border-box !important;
           }
 
-          /*
-           * 常见全屏根节点同步缩小高度。
-           * 对大多数 React/Vue 页面有效。
-           */
-          #root,
-          #app,
-          #__next,
-          [data-reactroot] {
-            min-height: calc(100vh - var(--pake-macos-top-bar-height)) !important;
+          *, *::before, *::after {
             box-sizing: border-box !important;
+          }
+
+          #pake-top-dom {
+            position: fixed !important;
+            inset: 0 0 auto 0 !important;
+            width: 100% !important;
+            height: var(--pake-macos-safe-top) !important;
+            min-height: var(--pake-macos-safe-top) !important;
+            z-index: 2147483647 !important;
+            background: transparent !important;
+          }
+
+          body > header,
+          body > nav,
+          body > [role="banner"],
+          #root > header,
+          #app > header,
+          #__next > header {
+            top: var(--pake-macos-safe-top) !important;
           }
           EOF
 
-      # 将普通 HTTP/HTTPS 链接强制设置为 target=_blank，
-      # 同时拦截点击事件，让链接尽量通过 Pake 的新窗口机制打开。
-      - name: Create open-links-in-new-window script
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          cat > "$RUNNER_TEMP/pake-open-links-new-window.js" <<'EOF'
+          cat > "$RUNNER_TEMP/pake-douyin-safe-area.js" <<EOF
           (() => {
             "use strict";
 
-            const isOpenableHttpUrl = (url) => {
-              if (!url) return false;
+            const SAFE_TOP = ${TOP_BAR_HEIGHT};
+            const MARKER = "data-pake-macos-safe-area";
+            let appliedRoot = null;
+            let scheduled = false;
 
-              try {
-                const parsed = new URL(url, window.location.href);
-                return parsed.protocol === "http:" || parsed.protocol === "https:";
-              } catch {
-                return false;
-              }
+            const isExcluded = (element) =>
+              !(element instanceof HTMLElement) ||
+              element.id === "pake-top-dom" ||
+              element.closest?.("#pake-top-dom");
+
+            const isFullPageRoot = (element) => {
+              if (isExcluded(element)) return false;
+              const rect = element.getBoundingClientRect();
+              const style = getComputedStyle(element);
+              return (
+                rect.top <= 2 &&
+                rect.width >= window.innerWidth * 0.75 &&
+                rect.height >= window.innerHeight * 0.65 &&
+                style.display !== "none" &&
+                style.visibility !== "hidden"
+              );
             };
 
-            const getAnchor = (event) => {
-              const target = event.target;
-              if (!(target instanceof Element)) return null;
-              return target.closest("a[href]");
-            };
-
-            const prepareAnchor = (anchor) => {
-              if (!(anchor instanceof HTMLAnchorElement)) return;
-              if (!isOpenableHttpUrl(anchor.href)) return;
-
-              // 保留下载、邮件、电话等特殊行为。
-              if (anchor.hasAttribute("download")) return;
-
-              anchor.target = "_blank";
-              anchor.rel = "noopener noreferrer";
-            };
-
-            const scanAnchors = (root = document) => {
-              if (root instanceof HTMLAnchorElement) {
-                prepareAnchor(root);
+            const findRoot = () => {
+              for (const selector of ["#root", "#app", "#__next", "[data-reactroot]"]) {
+                const element = document.querySelector(selector);
+                if (isFullPageRoot(element)) return element;
               }
 
-              if (root.querySelectorAll) {
-                root.querySelectorAll("a[href]").forEach(prepareAnchor);
-              }
+              return [...(document.body?.children || [])]
+                .filter(isFullPageRoot)
+                .sort((a, b) => {
+                  const ar = a.getBoundingClientRect();
+                  const br = b.getBoundingClientRect();
+                  return br.width * br.height - ar.width * ar.height;
+                })[0] || null;
             };
 
-            // 处理初始页面和动态渲染出来的链接。
-            scanAnchors();
+            const restoreRoot = () => {
+              if (!appliedRoot) return;
+              appliedRoot.style.removeProperty("transform");
+              appliedRoot.style.removeProperty("height");
+              appliedRoot.style.removeProperty("min-height");
+              appliedRoot.removeAttribute(MARKER);
+              appliedRoot = null;
+            };
 
-            const observer = new MutationObserver((mutations) => {
-              for (const mutation of mutations) {
-                for (const node of mutation.addedNodes) {
-                  if (node.nodeType === Node.ELEMENT_NODE) {
-                    scanAnchors(node);
-                  }
-                }
-              }
-            });
+            const apply = () => {
+              scheduled = false;
+              if (!document.body) return;
 
-            if (document.documentElement) {
-              observer.observe(document.documentElement, {
+              const root = findRoot();
+              if (!root) return;
+              if (appliedRoot && appliedRoot !== root) restoreRoot();
+              if (root.getAttribute(MARKER) === "true") return;
+
+              const transform = getComputedStyle(root).transform;
+              const existing = transform === "none" ? "" : transform;
+              root.style.setProperty(
+                "transform",
+                `${existing} translateY(${SAFE_TOP}px)`.trim(),
+                "important",
+              );
+              root.style.setProperty(
+                "height",
+                `calc(100vh - ${SAFE_TOP}px)`,
+                "important",
+              );
+              root.style.setProperty(
+                "min-height",
+                `calc(100vh - ${SAFE_TOP}px)`,
+                "important",
+              );
+              root.setAttribute(MARKER, "true");
+              appliedRoot = root;
+            };
+
+            const schedule = () => {
+              if (scheduled) return;
+              scheduled = true;
+              requestAnimationFrame(apply);
+            };
+
+            const start = () => {
+              schedule();
+              new MutationObserver(schedule).observe(document.documentElement, {
                 childList: true,
                 subtree: true,
               });
+              window.addEventListener("resize", schedule, { passive: true });
+              window.addEventListener("orientationchange", schedule, { passive: true });
+            };
+
+            if (document.readyState === "loading") {
+              document.addEventListener("DOMContentLoaded", start, { once: true });
+            } else {
+              start();
             }
-
-            // 捕获阶段拦截普通链接点击，尽量避免网站脚本把链接改回当前窗口。
-            document.addEventListener(
-              "click",
-              (event) => {
-                if (!(event instanceof MouseEvent)) return;
-                if (event.defaultPrevented) return;
-
-                // 只处理普通左键点击。
-                if (event.button !== 0) return;
-                if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) {
-                  return;
-                }
-
-                const anchor = getAnchor(event);
-                if (!anchor) return;
-
-                prepareAnchor(anchor);
-
-                if (!isOpenableHttpUrl(anchor.href)) return;
-                if (anchor.hasAttribute("download")) return;
-
-                event.preventDefault();
-                event.stopImmediatePropagation();
-
-                // 由 Pake 的 --new-window 配置接管新窗口。
-                window.open(
-                  anchor.href,
-                  "_blank",
-                  "noopener,noreferrer,width=1200,height=780,resizable=yes"
-                );
-              },
-              true
-            );
           })();
           EOF
 
@@ -259,18 +267,15 @@ jobs:
             "--height" "$PAKE_HEIGHT"
             "--app-version" "$PAKE_VERSION"
 
-            # macOS 隐藏原生标题栏。
+            # Must stay hidden
             "--hide-title-bar"
 
-            # 允许网页创建 Pake 原生新窗口。
-            "--new-window"
-
-            # 允许跨域链接继续留在 Pake 窗口体系中。
+            # Align with main.yml: do not blindly rewrite all link clicks.
+            # This keeps Telegram chat/group entry clicks in-app instead of opening new windows.
             "--force-internal-navigation"
 
-            # 注入顶部安全区域和新窗口链接处理脚本。
             "--inject"
-            "$RUNNER_TEMP/pake-macos-topbar.css,$RUNNER_TEMP/pake-open-links-new-window.js"
+            "$RUNNER_TEMP/pake-macos-safe-area.css,$RUNNER_TEMP/pake-douyin-safe-area.js"
           )
 
           if [ -n "$PAKE_ICON" ]; then
