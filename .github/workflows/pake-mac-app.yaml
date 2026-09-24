@@ -43,12 +43,6 @@ on:
         type: string
         default: "1.0.0"
 
-      top_bar_height:
-        description: "macOS traffic-light safe area in pixels"
-        required: false
-        type: string
-        default: "52"
-
       multi_arch:
         description: "Build universal Intel + Apple Silicon binary"
         required: false
@@ -93,160 +87,6 @@ jobs:
             src-tauri/target/
           key: ${{ runner.os }}-cargo-pake-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Create macOS traffic-light safe-area patch
-        shell: bash
-        env:
-          TOP_BAR_HEIGHT: ${{ inputs.top_bar_height }}
-        run: |
-          set -euo pipefail
-
-          case "$TOP_BAR_HEIGHT" in
-            ''|*[!0-9]*)
-              echo "top_bar_height must contain only digits"
-              exit 1
-              ;;
-          esac
-
-          cat > "$RUNNER_TEMP/pake-macos-safe-area.css" <<EOF
-          :root {
-            --pake-macos-safe-top: ${TOP_BAR_HEIGHT}px;
-          }
-
-          html,
-          body {
-            margin: 0 !important;
-            box-sizing: border-box !important;
-          }
-
-          *, *::before, *::after {
-            box-sizing: border-box !important;
-          }
-
-          #pake-top-dom {
-            position: fixed !important;
-            inset: 0 0 auto 0 !important;
-            width: 100% !important;
-            height: var(--pake-macos-safe-top) !important;
-            min-height: var(--pake-macos-safe-top) !important;
-            z-index: 2147483647 !important;
-            background: transparent !important;
-          }
-
-          body > header,
-          body > nav,
-          body > [role="banner"],
-          #root > header,
-          #app > header,
-          #__next > header {
-            top: var(--pake-macos-safe-top) !important;
-          }
-          EOF
-
-          cat > "$RUNNER_TEMP/pake-douyin-safe-area.js" <<EOF
-          (() => {
-            "use strict";
-
-            const SAFE_TOP = ${TOP_BAR_HEIGHT};
-            const MARKER = "data-pake-macos-safe-area";
-            let appliedRoot = null;
-            let scheduled = false;
-
-            const isExcluded = (element) =>
-              !(element instanceof HTMLElement) ||
-              element.id === "pake-top-dom" ||
-              element.closest?.("#pake-top-dom");
-
-            const isFullPageRoot = (element) => {
-              if (isExcluded(element)) return false;
-              const rect = element.getBoundingClientRect();
-              const style = getComputedStyle(element);
-              return (
-                rect.top <= 2 &&
-                rect.width >= window.innerWidth * 0.75 &&
-                rect.height >= window.innerHeight * 0.65 &&
-                style.display !== "none" &&
-                style.visibility !== "hidden"
-              );
-            };
-
-            const findRoot = () => {
-              for (const selector of ["#root", "#app", "#__next", "[data-reactroot]"]) {
-                const element = document.querySelector(selector);
-                if (isFullPageRoot(element)) return element;
-              }
-
-              return [...(document.body?.children || [])]
-                .filter(isFullPageRoot)
-                .sort((a, b) => {
-                  const ar = a.getBoundingClientRect();
-                  const br = b.getBoundingClientRect();
-                  return br.width * br.height - ar.width * ar.height;
-                })[0] || null;
-            };
-
-            const restoreRoot = () => {
-              if (!appliedRoot) return;
-              appliedRoot.style.removeProperty("transform");
-              appliedRoot.style.removeProperty("height");
-              appliedRoot.style.removeProperty("min-height");
-              appliedRoot.removeAttribute(MARKER);
-              appliedRoot = null;
-            };
-
-            const apply = () => {
-              scheduled = false;
-              if (!document.body) return;
-
-              const root = findRoot();
-              if (!root) return;
-              if (appliedRoot && appliedRoot !== root) restoreRoot();
-              if (root.getAttribute(MARKER) === "true") return;
-
-              const transform = getComputedStyle(root).transform;
-              const existing = transform === "none" ? "" : transform;
-              root.style.setProperty(
-                "transform",
-                `${existing} translateY(${SAFE_TOP}px)`.trim(),
-                "important",
-              );
-              root.style.setProperty(
-                "height",
-                `calc(100vh - ${SAFE_TOP}px)`,
-                "important",
-              );
-              root.style.setProperty(
-                "min-height",
-                `calc(100vh - ${SAFE_TOP}px)`,
-                "important",
-              );
-              root.setAttribute(MARKER, "true");
-              appliedRoot = root;
-            };
-
-            const schedule = () => {
-              if (scheduled) return;
-              scheduled = true;
-              requestAnimationFrame(apply);
-            };
-
-            const start = () => {
-              schedule();
-              new MutationObserver(schedule).observe(document.documentElement, {
-                childList: true,
-                subtree: true,
-              });
-              window.addEventListener("resize", schedule, { passive: true });
-              window.addEventListener("orientationchange", schedule, { passive: true });
-            };
-
-            if (document.readyState === "loading") {
-              document.addEventListener("DOMContentLoaded", start, { once: true });
-            } else {
-              start();
-            }
-          })();
-          EOF
-
       - name: Build macOS application
         shell: bash
         env:
@@ -267,15 +107,9 @@ jobs:
             "--height" "$PAKE_HEIGHT"
             "--app-version" "$PAKE_VERSION"
 
-            # Must stay hidden
             "--hide-title-bar"
 
-            # Align with main.yml: do not blindly rewrite all link clicks.
-            # This keeps Telegram chat/group entry clicks in-app instead of opening new windows.
             "--force-internal-navigation"
-
-            "--inject"
-            "$RUNNER_TEMP/pake-macos-safe-area.css,$RUNNER_TEMP/pake-douyin-safe-area.js"
           )
 
           if [ -n "$PAKE_ICON" ]; then
